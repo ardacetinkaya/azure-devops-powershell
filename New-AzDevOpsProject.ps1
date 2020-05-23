@@ -1,9 +1,9 @@
 [CmdletBinding()]
 param (
-    [Parameter()]
+    [Parameter(Mandatory = $true)]
     [string]
     $TenantId = [string]::Empty,
-    [Parameter()]
+    [Parameter(Mandatory = $true)]
     [string]
     $SubscriptionId = [string]::Empty,
     [Parameter()]
@@ -12,13 +12,13 @@ param (
     [Parameter()]
     [string]
     $ServicePrincipalKey = [string]::Empty,
-    [Parameter()]
+    [Parameter(Mandatory = $true)]
     [string]
     $OrganizationName = [string]::Empty,
-    [Parameter()]
+    [Parameter(Mandatory = $true)]
     [string]
     $PAT = [string]::Empty,
-    [Parameter()]
+    [Parameter(Mandatory = $true)]
     [string]
     $ProjectName = [string]::Empty,
     [Parameter()]
@@ -26,11 +26,108 @@ param (
     $ProjectDescription = "Project created with Azure DevOps Rest API"
 )
 
+function Initialize-Modules {
+    param (
+        [string[]]$Modules = @("Az", "AzureADPreview") 
+    )
+
+    foreach ($module in $Modules) {
+        if (-not (Get-InstalledModule -Name "$($module)" -ErrorAction Ignore)) {
+            Write-Host "Installing $($module) module..." -ForegroundColor White -BackgroundColor Black
+            Install-Module -Name "$($module)" -Force -AllowClobber
+            Import-Module "$($module)"
+        }
+        else {
+            Write-Host "Updating $($module) module..." -ForegroundColor White -BackgroundColor Black
+            Update-Module -Name "$($module)"
+        }
+    }
+}
+
+function New-AzADAppForDevops {
+    param (
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$OrganizationName,
+  
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$ApplicationName,
+  
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$TenantId,
+  
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$SubscriptionId
+    )
+    $applicationName = "$($OrganizationName)-$ApplicationName"
+    $appIdUri = "https://VisualStudio/SPN/$($applicationName)"
+    $appReplyUrls = @($appIdUri)
+    
+    if ($SubscriptionId) {
+        Connect-AzAccount -TenantId $TenantId -SubscriptionId "$($SubscriptionId)" | Out-Null
+        Set-AzContext -TenantId $TenantId -SubscriptionId $SubscriptionId | Out-Null
+    }
+    else {
+        throw "INVALID_SUBSCRIPTION_ID"
+    }
+  
+    Write-Host "Checking application $($applicationName)..." -ForegroundColor White -BackgroundColor Black
+    $aadApplication = Get-AzADApplication -DisplayName $applicationName
+    if ($null -ne $aadApplication) {
+        #Application exits, remove it
+        Remove-AzADApplication -DisplayName $applicationName
+        $aadApplication = $null
+    }
+    if ($null -eq $aadApplication) {
+        #Create application
+        Write-Host "Creating application $($applicationName)..." -ForegroundColor White -BackgroundColor Black
+        $aadApplication = New-AzADApplication -DisplayName $applicationName -HomePage "https://VisualStudio/SPN" -IdentifierUris $appIdUri -ReplyUrls $appReplyUrls
+        Write-Host "Application $($applicationName) is created..." -ForegroundColor White -BackgroundColor Black
+        $aadApplication
+        if (-not $aadApplication) {
+            throw "ADAPPLICATION_ERROR"
+        }
+
+        #Create ServicePrincipal and Owner role
+        Write-Host "Adding service principal to $($applicationName)..." -ForegroundColor White -BackgroundColor Black
+        $servicePrincipal = New-AzADServicePrincipal -DisplayName $applicationName -Role "Owner" -ApplicationId $aadApplication.ApplicationId
+        if (-not $servicePrincipal) {
+            throw "SERVICEPRINCIPAL_ERROR"
+        }
+  
+        $servicePrincipal = Get-AzADServicePrincipal -ObjectId $servicePrincipal.Id
+        if (-not $servicePrincipal) {
+            throw "SERVICEPRINCIPAL_GET_ERROR"
+        }
+  
+        #Create AD Application Secret
+        $startDate = $(Get-Date)
+        $endDate = $startDate.AddYears(2)
+
+        $secret = New-AzureADApplicationPasswordCredential -ObjectId $aadApplication.ObjectId `
+            -CustomKeyIdentifier "DevOps" `
+            -StartDate $startDate -EndDate $endDate
+        $secret
+        return @(
+            $aadApplication, $secret, $servicePrincipal
+        )
+    }
+    return @(
+        "***", "***", "***"
+    )
+}
+
 function New-AzDevOpsProject {
     param (
         [string]$Version = "5.1",
+        [Parameter(Mandatory = $true)]
         [string]$Organization = [string]::Empty,
+        [Parameter(Mandatory = $true)]
         [string]$PAT = [string]::Empty,
+        [Parameter(Mandatory = $true)]
         [string]$Body = [string]::Empty
     )
     
@@ -61,8 +158,11 @@ function New-AzDevOpsProject {
 function Get-AzDevOpsProject {
     param (
         [string]$Version = "5.1",
+        [Parameter(Mandatory = $true)]
         [string]$Organization = [string]::Empty,
+        [Parameter(Mandatory = $true)]
         [string]$PAT = [string]::Empty,
+        [Parameter(Mandatory = $true)]
         [string]$ProjectName = [string]::Empty
     )
     $encodedPat = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes(":$PAT"))
@@ -77,18 +177,8 @@ function Get-AzDevOpsProject {
     catch {
         Write-Verbose "An exception was caught: $($_.Exception.Message)"
         $_.Exception.Response 
-        # @{
-        #     IsSuccessStatusCode = $_.Exception.Response.IsSuccessStatusCode
-        #     StatusCode          = $_.Exception.Response.StatusCode
-        # }
-        #$response.BaseResponse.StatusCode.Value__
     }
 
-    # $resp = (Invoke-WebRequest -Uri "https://dev.azure.com/$($Organization)/_apis/projects/$($ProjectName)?api-version=$($Version)" `
-    #         -Method "GET" `
-    #         -Headers @{Authorization = "Basic $encodedPat" } `
-    #         -ContentType application/json ).BaseResponse
-    $resp 
     return $resp | ConvertTo-Json
     
 }
@@ -96,9 +186,13 @@ function Get-AzDevOpsProject {
 function Get-AzDevOpsServiceConnection {
     param (
         [string]$Version = "5.1-preview.2",
+        [Parameter(Mandatory = $true)]
         [string]$Organization = [string]::Empty,
+        [Parameter(Mandatory = $true)]
         [string]$PAT = [string]::Empty,
+        [Parameter(Mandatory = $true)]
         [string]$ProjectName = [string]::Empty,
+        [Parameter(Mandatory = $true)]
         [string]$EndPointName = [string]::Empty
     )
     $encodedPat = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes(":$PAT"))
@@ -118,13 +212,16 @@ function Get-AzDevOpsServiceConnection {
     return $resp.Content | ConvertTo-Json | ConvertFrom-Json
 }
 
-
 function New-AzDevOpsServiceConnection {
     param (
         [string]$Version = "5.1-preview.2",
+        [Parameter(Mandatory = $true)]
         [string]$Organization = [string]::Empty,
+        [Parameter(Mandatory = $true)]
         [string]$ProjectName = [string]::Empty,
+        [Parameter(Mandatory = $true)]
         [string]$PAT = [string]::Empty,
+        [Parameter(Mandatory = $true)]
         [string]$Body = [string]::Empty
     )
 
@@ -168,6 +265,14 @@ function Start-Execution {
     }
 }
 "@
+    Write-Host "Checking modules..."
+    Initialize-Modules
+    Write-Host "Checking AD Application..."
+    New-AzADAppForDevops -OrganizationName "$($organizationName)" `
+        -ApplicationName "$($projectName)-DevOps" `
+        -TenantId "$($tenantId)" `
+        -SubscriptionId "$($subscriptionId)"
+    
     Write-Host "Checking if project $($projectName) exists ..." -ForegroundColor White -BackgroundColor Black
     $project = Get-AzDevOpsProject -Organization "$($organizationName)" -PAT "$($pat)" -ProjectName "$($projectName)"
     if ($project.IsSuccessStatusCode -eq $false) {
@@ -202,8 +307,8 @@ function Start-Execution {
         -ProjectName "$($projectName)" `
         -EndPointName "$($projectName)-ServiceEndpoint"
 
-   
-    if (0 -eq  ($serviceConnection | ConvertFrom-Json).count) {
+    ($serviceConnection | ConvertFrom-Json)
+    if (0 -eq ($serviceConnection | ConvertFrom-Json).count) {
         Write-Host "No service connection, creating a new one ..." -ForegroundColor White -BackgroundColor Black
         New-AzDevOpsServiceConnection -Organization "$($organizationName)" `
             -PAT "$($pat)" `
