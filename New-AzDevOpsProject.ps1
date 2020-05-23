@@ -6,12 +6,6 @@ param (
     [Parameter(Mandatory = $true)]
     [string]
     $SubscriptionId = [string]::Empty,
-    [Parameter()]
-    [string]
-    $ServicePrincipalId = [string]::Empty,
-    [Parameter()]
-    [string]
-    $ServicePrincipalKey = [string]::Empty,
     [Parameter(Mandatory = $true)]
     [string]
     $OrganizationName = [string]::Empty,
@@ -67,6 +61,7 @@ function New-AzADAppForDevops {
     $appReplyUrls = @($appIdUri)
     
     if ($SubscriptionId) {
+        Write-Host "Connect AzAccount..." -ForegroundColor White -BackgroundColor Black
         Connect-AzAccount -TenantId $TenantId -SubscriptionId "$($SubscriptionId)" | Out-Null
         Set-AzContext -TenantId $TenantId -SubscriptionId $SubscriptionId | Out-Null
     }
@@ -78,7 +73,7 @@ function New-AzADAppForDevops {
     $aadApplication = Get-AzADApplication -DisplayName $applicationName
     if ($null -ne $aadApplication) {
         #Application exits, remove it
-        Remove-AzADApplication -DisplayName $applicationName
+        Remove-AzADApplication -DisplayName $applicationName -Force
         $aadApplication = $null
     }
     if ($null -eq $aadApplication) {
@@ -106,13 +101,14 @@ function New-AzADAppForDevops {
         #Create AD Application Secret
         $startDate = $(Get-Date)
         $endDate = $startDate.AddYears(2)
-
+        Write-Host "Connect AzureAD..." -ForegroundColor White -BackgroundColor Black
+        Connect-AzureAD -TenantId "$($TenantId)" | Out-Null
         $secret = New-AzureADApplicationPasswordCredential -ObjectId $aadApplication.ObjectId `
             -CustomKeyIdentifier "DevOps" `
             -StartDate $startDate -EndDate $endDate
-        $secret
+
         return @(
-            $aadApplication, $secret, $servicePrincipal
+            $aadApplication, $secret.Value, $servicePrincipal.ApplicationId
         )
     }
     return @(
@@ -246,9 +242,7 @@ function Start-Execution {
         [string]$projectDescription = [string]::Empty,
         [string]$sourceControlType = "Git",
         [string]$subscriptionId = [string]::Empty,
-        [string]$tenantId = [string]::Empty,
-        [string]$servicePrincipalId = [string]::Empty,
-        [string]$servicePrincipalKey = [string]::Empty
+        [string]$tenantId = [string]::Empty
     )
 
     $createProjectBody = @"
@@ -268,18 +262,25 @@ function Start-Execution {
     Write-Host "Checking modules..."
     Initialize-Modules
     Write-Host "Checking AD Application..."
-    New-AzADAppForDevops -OrganizationName "$($organizationName)" `
+    $appResult = New-AzADAppForDevops -OrganizationName "$($organizationName)" `
         -ApplicationName "$($projectName)-DevOps" `
         -TenantId "$($tenantId)" `
         -SubscriptionId "$($subscriptionId)"
     
+    $servicePrincipalId = $appResult[3]
+    $servicePrincipalKey = $appResult[2]
     Write-Host "Checking if project $($projectName) exists ..." -ForegroundColor White -BackgroundColor Black
     $project = Get-AzDevOpsProject -Organization "$($organizationName)" -PAT "$($pat)" -ProjectName "$($projectName)"
-    if ($project.IsSuccessStatusCode -eq $false) {
+    $result = $project | ConvertFrom-Json
+    
+    if ($result.StatusCode -eq 404) {
         Write-Host "Project($($projectName)) is not existing, creating a project ..." -ForegroundColor White -BackgroundColor Black
         New-AzDevOpsProject -Organization "$($organizationName)" -PAT "$($pat)" -Body $createProjectBody
         Write-Host "Project($($projectName)) is created ..." -ForegroundColor White -BackgroundColor Black
         $project = Get-AzDevOpsProject -Organization "$($organizationName)" -PAT "$($pat)" -ProjectName "$($projectName)"    
+    }elseif($result.StatusCode -eq 401){
+        Write-Host "Unauthorized" -ForegroundColor Red -BackgroundColor Black
+        exit -1;
     }
     Write-Host "Project($($projectName)) is ready..." -ForegroundColor White -BackgroundColor Black
     $addServicePrincipalBody = @"
@@ -307,7 +308,6 @@ function Start-Execution {
         -ProjectName "$($projectName)" `
         -EndPointName "$($projectName)-ServiceEndpoint"
 
-    ($serviceConnection | ConvertFrom-Json)
     if (0 -eq ($serviceConnection | ConvertFrom-Json).count) {
         Write-Host "No service connection, creating a new one ..." -ForegroundColor White -BackgroundColor Black
         New-AzDevOpsServiceConnection -Organization "$($organizationName)" `
@@ -324,7 +324,5 @@ Start-Execution -organizationName $OrganizationName `
     -projectName $ProjectName `
     -projectDescription $ProjectDescription `
     -subscriptionId $SubscriptionId `
-    -tenantId $TenantId `
-    -servicePrincipalId $ServicePrincipalId `
-    -servicePrincipalKey $ServicePrincipalKey `
+    -tenantId $TenantId 
 
