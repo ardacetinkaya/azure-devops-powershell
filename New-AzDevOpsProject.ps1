@@ -56,12 +56,13 @@ function New-AzADAppForDevops {
         [ValidateNotNullOrEmpty()]
         [string]$SubscriptionId
     )
+    $guid = $(New-Guid).ToString()
     $applicationName = "$($OrganizationName)-$ApplicationName"
-    $appIdUri = "https://VisualStudio/SPN/$($applicationName)"
+    $appIdUri = "https://VisualStudio/SPN$($guid)"
     $appReplyUrls = @($appIdUri)
     
     if ($SubscriptionId) {
-        Write-Host "Connect AzAccount..." -ForegroundColor White -BackgroundColor Black
+        Write-Host "Connecting to AzAccount... Please enter sign-in account credantials." -ForegroundColor White -BackgroundColor Black
         Connect-AzAccount -TenantId $TenantId -SubscriptionId "$($SubscriptionId)" | Out-Null
         Set-AzContext -TenantId $TenantId -SubscriptionId $SubscriptionId | Out-Null
     }
@@ -101,7 +102,7 @@ function New-AzADAppForDevops {
         #Create AD Application Secret
         $startDate = $(Get-Date)
         $endDate = $startDate.AddYears(2)
-        Write-Host "Connect AzureAD..." -ForegroundColor White -BackgroundColor Black
+        Write-Host "Connecting to AzureAD...Please enter sign-in account credantials." -ForegroundColor White -BackgroundColor Black
         Connect-AzureAD -TenantId "$($TenantId)" | Out-Null
         $secret = New-AzureADApplicationPasswordCredential -ObjectId $aadApplication.ObjectId `
             -CustomKeyIdentifier "DevOps" `
@@ -124,17 +125,35 @@ function New-AzDevOpsProject {
         [Parameter(Mandatory = $true)]
         [string]$PAT = [string]::Empty,
         [Parameter(Mandatory = $true)]
-        [string]$Body = [string]::Empty
+        [string]$ProjectName = [string]::Empty,
+        [Parameter(Mandatory = $true)]
+        [string]$ProjectDescription = [string]::Empty,
+        [Parameter(Mandatory = $true)]
+        [string]$SourceControlType = "Git"
     )
     
+    $createProjectBody = @"
+{
+    "name": "$($ProjectName)",
+    "description": "$($ProjectDescription)",
+    "capabilities": {
+        "versioncontrol": {
+            "sourceControlType": "$($SourceControlType)"
+        },
+        "processTemplate": {
+            "templateTypeId": "6b724908-ef14-45cf-84f8-768b5384da45"
+        }
+    }
+}
+"@
     $encodedPat = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes(":$PAT"))
 
-    $data = $Body | ConvertFrom-Json
+    $data = $createProjectBody | ConvertFrom-Json
     $resp = Invoke-WebRequest -Uri "https://dev.azure.com/$($Organization)/_apis/projects?api-version=$($Version)" `
         -Method "POST" `
         -Headers @{Authorization = "Basic $encodedPat" } `
         -ContentType application/json `
-        -Body $Body
+        -Body $createProjectBody
 
     $returnCode = $resp.StatusCode
     $returnStatus = $resp.StatusDescription
@@ -145,7 +164,7 @@ function New-AzDevOpsProject {
         break
     }
     else {
-        Write-Host "Project $($Data.Name)($($response.id)) is created."
+        Write-Host "Project $($data.Name)($($response.id)) is created."
     }
     return $response
     
@@ -153,7 +172,7 @@ function New-AzDevOpsProject {
 
 function Get-AzDevOpsProject {
     param (
-        [string]$Version = "5.1",
+        [string]$Version = "6.0-preview.4",
         [Parameter(Mandatory = $true)]
         [string]$Organization = [string]::Empty,
         [Parameter(Mandatory = $true)]
@@ -167,7 +186,7 @@ function Get-AzDevOpsProject {
         (Invoke-WebRequest -Uri "https://dev.azure.com/$($Organization)/_apis/projects/$($ProjectName)?api-version=$($Version)" `
                 -Method "GET" `
                 -Headers @{Authorization = "Basic $encodedPat" } `
-                -ContentType application/json ).BaseResponse
+                -ContentType application/json )
 
     }
     catch {
@@ -175,13 +194,17 @@ function Get-AzDevOpsProject {
         $_.Exception.Response 
     }
 
-    return $resp | ConvertTo-Json
+    if($null -eq $resp.Content)
+    {
+        return $null
+    }
+    return $resp.Content | ConvertFrom-Json
     
 }
 
 function Get-AzDevOpsServiceConnection {
     param (
-        [string]$Version = "5.1-preview.2",
+        [string]$Version = "6.0-preview.4",
         [Parameter(Mandatory = $true)]
         [string]$Organization = [string]::Empty,
         [Parameter(Mandatory = $true)]
@@ -214,21 +237,62 @@ function New-AzDevOpsServiceConnection {
         [Parameter(Mandatory = $true)]
         [string]$Organization = [string]::Empty,
         [Parameter(Mandatory = $true)]
+        [string]$TenantId = [string]::Empty,
+        [Parameter(Mandatory = $true)]
+        [string]$SubscriptionId = [string]::Empty,
+        [Parameter(Mandatory = $true)]
         [string]$ProjectName = [string]::Empty,
+        [Parameter(Mandatory = $true)]
+        [string]$ProjectId = [string]::Empty,
         [Parameter(Mandatory = $true)]
         [string]$PAT = [string]::Empty,
         [Parameter(Mandatory = $true)]
-        [string]$Body = [string]::Empty
+        [string]$ServicePrincipalId = [string]::Empty,
+        [Parameter(Mandatory = $true)]
+        [string]$ServicePrincipalKey = [string]::Empty
     )
+
+    $addServicePrincipalBody = @"
+{
+    "data": {
+        "SubscriptionId": "$($SubscriptionId)",
+        "SubscriptionName": "Visual Studio Premium with MSDN",
+        "environment": "AzureCloud",
+        "scopeLevel": "Subscription",
+        "creationMode": "Manual"
+    },
+    "name": "$($ProjectName)-ServiceEndpoint",
+    "type": "AzureRM",
+    "authorization": {
+        "parameters": {
+            "tenantid": "$($TenantId)",
+            "serviceprincipalid": "$($ServicePrincipalId)",
+            "serviceprincipalkey": "$($ServicePrincipalKey)",
+            "authenticationType": "spnKey",
+        },
+        "scheme": "ServicePrincipal"
+    },
+    "isReady": true,
+    "isShared": false,
+    "serviceEndpointProjectReferences": [
+        {
+          "projectReference": {
+            "id": "$($ProjectId)",
+            "name": "$($ProjectName)"
+          },
+          "name": "$($ProjectName)-ServiceEndpoint",
+        }
+      ]
+}
+"@
 
     $encodedPat = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes(":$PAT"))
 
-    $data = $Body | ConvertFrom-Json
     $resp = Invoke-WebRequest -Uri "https://dev.azure.com/$($Organization)/$($ProjectName)/_apis/serviceendpoint/endpoints?api-version=$($Version)" `
         -Method "POST" `
         -Headers @{Authorization = "Basic $encodedPat" } `
         -ContentType application/json `
-        -Body $Body
+        -Body $addServicePrincipalBody
 
     return $resp | ConvertFrom-Json
     
@@ -245,78 +309,50 @@ function Start-Execution {
         [string]$tenantId = [string]::Empty
     )
 
-    $createProjectBody = @"
-{
-    "name": "$($projectName)",
-    "description": "$($projectDescription)",
-    "capabilities": {
-    "versioncontrol": {
-        "sourceControlType": "$($sourceControlType)"
-    },
-    "processTemplate": {
-        "templateTypeId": "6b724908-ef14-45cf-84f8-768b5384da45"
-    }
-    }
-}
-"@
+
+
     Write-Host "Checking modules..."
     Initialize-Modules
     Write-Host "Checking AD Application..."
     $appResult = New-AzADAppForDevops -OrganizationName "$($organizationName)" `
-        -ApplicationName "$($projectName)-DevOps" `
+        -ApplicationName "$($projectName)-$($subscriptionId)" `
         -TenantId "$($tenantId)" `
         -SubscriptionId "$($subscriptionId)"
     
     $servicePrincipalId = $appResult[3]
     $servicePrincipalKey = $appResult[2]
-    Write-Host "Checking if project $($projectName) exists ..." -ForegroundColor White -BackgroundColor Black
+    Write-Host "Checking if project $($projectName) exists..." -ForegroundColor White -BackgroundColor Black
     $project = Get-AzDevOpsProject -Organization "$($organizationName)" -PAT "$($pat)" -ProjectName "$($projectName)"
-    $result = $project | ConvertFrom-Json
-    
-    if ($result.StatusCode -eq 404) {
-        Write-Host "Project($($projectName)) is not existing, creating a project ..." -ForegroundColor White -BackgroundColor Black
-        New-AzDevOpsProject -Organization "$($organizationName)" -PAT "$($pat)" -Body $createProjectBody
-        Write-Host "Project($($projectName)) is created ..." -ForegroundColor White -BackgroundColor Black
-        $project = Get-AzDevOpsProject -Organization "$($organizationName)" -PAT "$($pat)" -ProjectName "$($projectName)"    
-    }elseif($result.StatusCode -eq 401){
-        Write-Host "Unauthorized" -ForegroundColor Red -BackgroundColor Black
-        exit -1;
+    $projectid=[string]::Empty
+    if ($null -eq $project) {
+        Write-Host "Project($($projectName)) is not existing, creating a project..." -ForegroundColor White -BackgroundColor Black
+        New-AzDevOpsProject -Organization "$($organizationName)" -PAT "$($pat)" `
+            -ProjectName "$($projectName)" `
+            -ProjectDescription "$($projectDescription)" `
+            -SourceControlType "Git"
     }
-    Write-Host "Project($($projectName)) is ready..." -ForegroundColor White -BackgroundColor Black
-    $addServicePrincipalBody = @"
-{
-    "data": {
-        "SubscriptionId": "$($subscriptionId)",
-        "SubscriptionName": "Visual Studio Premium with MSDN"
-    },
-    "name": "$($projectName)-ServiceEndpoint",
-    "type": "AzureRM",
-    "authorization": {
-        "parameters": {
-            "tenantId": "$($tenantId)",
-            "servicePrincipalId": "$($servicePrincipalId)",
-            "servicePrincipalKey": "$($servicePrincipalKey)"
-        },
-        "scheme": "ServicePrincipal"
-    },
-    "isReady": true
-}
-"@
-    Write-Host "Checking Service Connection ..." -ForegroundColor White -BackgroundColor Black
+    $project = Get-AzDevOpsProject -Organization "$($organizationName)" -PAT "$($pat)" -ProjectName "$($projectName)" 
+    $projectid=$project.id  
+
+    Write-Host "Checking Service Connection..." -ForegroundColor White -BackgroundColor Black
     $serviceConnection = Get-AzDevOpsServiceConnection -Organization "$($organizationName)" `
         -PAT "$($pat)" `
         -ProjectName "$($projectName)" `
         -EndPointName "$($projectName)-ServiceEndpoint"
 
     if (0 -eq ($serviceConnection | ConvertFrom-Json).count) {
-        Write-Host "No service connection, creating a new one ..." -ForegroundColor White -BackgroundColor Black
-        New-AzDevOpsServiceConnection -Organization "$($organizationName)" `
-            -PAT "$($pat)" `
-            -ProjectName "$($projectName)" `
-            -Body $addServicePrincipalBody
+        Write-Host "No service connection, creating a new one..." -ForegroundColor White -BackgroundColor Black
+        $serviceConnection = New-AzDevOpsServiceConnection -Organization "$($organizationName)" `
+                                -PAT "$($pat)" `
+                                -TenantId "$($tenantId)" `
+                                -SubscriptionId "$($subscriptionId)" `
+                                -ProjectId "$($projectid)" `
+                                -ProjectName "$($projectName)" `
+                                -ServicePrincipalId "$($servicePrincipalId)" `
+                                -ServicePrincipalKey "$($servicePrincipalKey)" `
+
         Write-Host "Service Connection is created..." -ForegroundColor White -BackgroundColor Black
     }
-    Write-Host "Service Connection is ready ..." -ForegroundColor White -BackgroundColor Black
 }
 
 Start-Execution -organizationName $OrganizationName `
